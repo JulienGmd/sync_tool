@@ -37,6 +37,13 @@ SYNC_SCRIPT=$(realpath "$0")
 
 # --------------------------------- FUNCTIONS ----------------------------------
 
+notify() {
+  MESSAGE=$1
+  if [ $ENABLE_NOTIFY = "true" ]; then
+    notify-send "SyncTool" "$MESSAGE"
+  fi
+}
+
 rclone_pull() {
   if [ -f /tmp/sync_tool_push_pull.lock ]; then echo "pull locked"; return; fi
   trap 'rm -f /tmp/sync_tool_push_pull.lock' EXIT
@@ -53,8 +60,39 @@ rclone_push() {
   rm -f /tmp/sync_tool_push_pull.lock
 }
 
+create_symlink() {
+  file=$1
+  if [ -z "$file" ]; then echo "usage: create_symlink <file>"; return; fi
+  sync_file=$RCLONE_LOCAL$file
+  if [ ! -f "$sync_file" ]; then echo "File not synced: $sync_file"; return; fi
+
+  mkdir -pv "$(dirname "$file")"
+  if [ -f "$file" ] && [ ! -L "$file" ]; then
+    # file
+    mv -v "$file" "$file.bak"
+    ln -sv "$sync_file" "$file"
+  elif [ -L "$file" ]; then
+    if [ "$(readlink -f "$file")" != "$sync_file" ]; then
+      # symlink pointing to a different file
+      rm -v "$file"
+      ln -sv "$sync_file" "$file"
+    fi
+  else
+    # no file (or hardlink?)
+    ln -sv "$sync_file" "$file"
+  fi
+}
+
+# Create symlinks for files on the machine to point to the local directory
+create_symlinks() {
+  while IFS= read -r -d '' file; do
+    file_path=${file#$RCLONE_LOCAL}  # Remove RCLONE_LOCAL from the path
+    create_symlink "$file_path"
+  done < <(find $RCLONE_LOCAL -type f -print0)
+}
+
 # Add a file or directory to the local directory, if rclone_sync is running,
-# it will be synchronized immediately. Else, it will be synchronized on the next
+# it will be uploaded immediately. Else, it will be uploaded on the next
 # run of rclone_sync.
 sync() {
   file=$1
@@ -62,55 +100,27 @@ sync() {
 
   mkdir -pv "$RCLONE_LOCAL$(dirname "$file")"
   cp -rv "$file" "$RCLONE_LOCAL$(dirname "$file")"
-}
-
-# Create symlinks for files on the machine to point to the local directory
-create_symlinks() {
-  while IFS= read -r -d '' file; do
-    file_path=${file#$RCLONE_LOCAL}
-    mkdir -pv "$(dirname "$file_path")"
-    if [ -f "$file_path" ] || [ -d "$file_path" ] && [ ! -L "$file_path" ]; then
-      # file or dir
-      mv -v "$file_path" "$file_path.bak"
-      ln -sv "$file" "$file_path"
-    elif [ -L "$file_path" ]; then
-      if [ "$(readlink -f "$file_path")" != "$file" ]; then
-        # symlink pointing to a different file
-        rm -v "$file_path"
-        ln -sv "$file" "$file_path"
-      fi
-    else
-      # no file
-      ln -sv "$file" "$file_path"
-    fi
-  done < <(find $RCLONE_LOCAL -type f -print0)
-}
-
-notify() {
-  MESSAGE=$1
-  if [ $ENABLE_NOTIFY = "true" ]; then
-    notify-send "SyncTool" "$MESSAGE"
-  fi
+  create_symlinks
 }
 
 rclone_sync() {
 #  set -x
 
   cleanup() {
-    rm -f /tmp/sync_tool_rclone_sync.lock;
+    rm -f /tmp/sync_tool_rclone_sync.lock
     fusermount -u $RCLONE_MOUNT  # Unmount the remote
   }
 
   # Lock the function to prevent multiple instances from running
-  lockfile -r 0 /tmp/sync_tool_rclone_sync.lock || exit 1
+  if [ -f /tmp/sync_tool_rclone_sync.lock ]; then echo "rclone_sync is already running"; exit 1; fi
   trap cleanup EXIT
-
-  rclone_pull
-  create_symlinks
 
   # Mount the remote in the background (optional)
   mkdir -p $RCLONE_MOUNT
   rclone mount $RCLONE_REMOTE $RCLONE_MOUNT &
+
+  rclone_pull
+  create_symlinks
 
   # Watch for file events and do continuous immediate syncing and regular interval syncing:
   while inotifywait --recursive --timeout $FORCED_SYNC_INTERVAL -e $WATCH_EVENTS $RCLONE_LOCAL; do
