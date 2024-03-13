@@ -4,8 +4,6 @@ set -e
 # Copy stdout and stderr to a log file
 exec > >(tee /tmp/sync_tool.log) 2>&1
 
-# Lock the script to prevent multiple instances from running
-lockfile -r 0 /tmp/sync_tool.lock || exit 1
 trap 'on_exit' EXIT
 
 
@@ -22,7 +20,7 @@ trap 'on_exit' EXIT
 # The local and remote directories to synchronize
 RCLONE_LOCAL="/home/ju/.sync"
 RCLONE_REMOTE="remote:sync"  # list them with `rclone listremotes`
-RCLONE_MOUNT="/home/ju/Sync"
+RCLONE_MOUNT="/home/ju/Sync" # Mount the remote to this directory (does not affect the sync)
 
 # The rclone commands to run
 RCLONE_PULL="rclone sync -v $RCLONE_REMOTE $RCLONE_LOCAL"
@@ -42,7 +40,7 @@ SYNC_SCRIPT=$(realpath "$0")
 # --------------------------------- FUNCTIONS ----------------------------------
 
 on_exit() {
-  rm -f /tmp/sync_tool.lock;
+  rm -f /tmp/sync_tool_rclone_sync.lock;
   rm -f /tmp/sync_tool_push_pull.lock;
   fusermount -u $RCLONE_MOUNT  # Unmount the remote
   echo "Exiting"
@@ -70,6 +68,8 @@ notify() {
 }
 
 rclone_sync() {
+  # Lock the script to prevent multiple instances from running
+  lockfile -r 0 /tmp/sync_tool_rclone_sync.lock || exit 1
 #  set -x
   rclone_pull
   # Watch for file events and do continuous immediate syncing and regular interval syncing:
@@ -90,7 +90,7 @@ rclone_sync() {
 
 systemd_setup() {
 #  set -x
-  SERVICE_FILE="$HOME/.config/systemd/user/rclone_sync.$RCLONE_REMOTE.service"
+  SERVICE_FILE="$HOME/.config/systemd/user/sync_tool.rclone_sync.service"
   if [ -f "$SERVICE_FILE" ]; then
     echo "Unit file already exists: $SERVICE_FILE - Not overwriting."
   else
@@ -111,10 +111,10 @@ WantedBy=default.target
 EOF
   fi
   systemctl --user daemon-reload
-  systemctl --user enable --now rclone_sync.$RCLONE_REMOTE
-  systemctl --user status rclone_sync.$RCLONE_REMOTE
+  systemctl --user enable --now sync_tool.rclone_sync
+  systemctl --user status sync_tool.rclone_sync
   echo "You can watch the service logs with this command:"
-  echo "    journalctl --user-unit rclone_sync.$RCLONE_REMOTE"
+  echo "    journalctl --user-unit sync_tool.rclone_sync"
   echo "You can watch the script logs with this command:"
   echo "    tail -f /tmp/sync_tool.log"
 }
@@ -123,7 +123,7 @@ EOF
 # ----------------------------------- MAIN -------------------------------------
 
 if [ $# = 0 ]; then
-  sleep 10  # Wait for the network and dbus to be ready
+  sleep 5  # Wait for the network and dbus to be ready
   # No arguments given, mount the remote for easy access (optional) and start the sync
   mkdir -p $RCLONE_MOUNT
   rclone mount $RCLONE_REMOTE $RCLONE_MOUNT &
