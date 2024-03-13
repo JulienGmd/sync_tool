@@ -1,86 +1,130 @@
 #!/bin/bash
-set -e  # exit on error
+set -e
 
-dir=$(realpath "$(dirname "$0")")
-to_sync_files=()
+# Copy stdout and stderr to a log file
+exec > >(tee /tmp/sync_tool.log) 2>&1
 
-source .config
+lockfile -r 0 /tmp/sync_tool.lock || exit 1
+trap 'on_exit' EXIT
 
-function echo_success() { echo -e "\e[32m$1\e[0m"; }
-function echo_warning() { echo -e "\e[33m$1\e[0m"; }
-function echo_error() { echo -e "\e[31m$1\e[0m"; }
-function isFileOrDir() { { [ -f "$1" ] || [ -d "$1" ]; } && [ ! -L "$1" ]; }
 
-# params: $1=repo_url, $2=to_dir
-function bareClone() {
-  git clone "$1" "$dir/tmp/bare_clone"
-  mkdir -p "$2"
-  mv "$dir/tmp/bare_clone/.git" "$2/.git"
-  rm -rf "$dir/tmp/bare_clone"
+# ----------------------------------- INFOS ------------------------------------
+
+# PULL from the remote at startup.
+# PUSH to the remote on every file change.
+#
+# TODO VOIR rclone --backup-dir
+
+
+# ---------------------------------- CONFIG ------------------------------------
+
+# The local and remote directories to synchronize
+RCLONE_LOCAL="/home/ju/.sync"
+RCLONE_REMOTE="remote:sync"  # list them with `rclone listremotes`
+RCLONE_MOUNT="/home/ju/Sync"
+
+# The rclone commands to run
+RCLONE_PULL="rclone sync -v $RCLONE_REMOTE $RCLONE_LOCAL"
+RCLONE_PUSH="rclone sync -v $RCLONE_LOCAL $RCLONE_REMOTE"
+
+# The file events that inotifywait should watch for
+WATCH_EVENTS="modify,delete,create,move"
+
+SYNC_DELAY=5
+FORCED_SYNC_INTERVAL=3600
+
+ENABLE_NOTIFY=true
+
+SYNC_SCRIPT=$(realpath "$0")
+
+
+# --------------------------------- FUNCTIONS ----------------------------------
+
+on_exit() {
+  rm -f /tmp/sync_tool.lock;
+  rm -f /tmp/sync_tool_push_pull.lock;
 }
 
-# params: $1=to_dir
-function copyLocalToDir() {
-  for file in "${to_sync_files[@]}"; do
-    if isFileOrDir "$file"; then
-      cp -rfv "$file" "$1"
+rclone_pull() {
+  if [ -f /tmp/sync_tool_push_pull.lock ]; then echo "pull locked"; return; fi
+  echo "Pulling from remote"
+  $RCLONE_PULL
+  rm -f /tmp/sync_tool_push_pull.lock
+}
+
+rclone_push() {
+  if [ -f /tmp/sync_tool_push_pull.lock ]; then echo "push locked"; return; fi
+  echo "Pushing to remote"
+  $RCLONE_PUSH
+  rm -f /tmp/sync_tool_push_pull.lock
+}
+
+notify() {
+  MESSAGE=$1
+  if [ $ENABLE_NOTIFY = "true" ]; then
+    notify-send "SyncTool" "$MESSAGE"
+  fi
+}
+
+rclone_sync() {
+#  set -x
+  notify "Startup"
+  rclone_pull
+  # Watch for file events and do continuous immediate syncing and regular interval syncing:
+  while inotifywait --recursive --timeout $FORCED_SYNC_INTERVAL -e $WATCH_EVENTS $RCLONE_LOCAL; do
+    if [ $? -eq 0 ]; then  # file change detected
+      sleep $SYNC_DELAY
+      rclone_push
+      notify "Synchronized files change"
+    elif [ $? -eq 1 ]; then  # inotifywait error
+      notify "inotifywait error exit code 1"
+      sleep 10
+    elif [ $? -eq 2 ]; then  # every FORCED_SYNC_INTERVAL
+      echo "Forced synchronization"
+      rclone_push
+      notify "Synchronized"
     fi
   done
 }
 
+systemd_setup() {
+#  set -x
+  SERVICE_FILE="$HOME/.config/systemd/user/rclone_sync.$RCLONE_REMOTE.service"
+  if [ -f "$SERVICE_FILE" ]; then
+    echo "Unit file already exists: $SERVICE_FILE - Not overwriting."
+  else
+    mkdir -p "$(dirname "$SERVICE_FILE")"
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=Sync files with rclone
 
+[Service]
+ExecStart=$SYNC_SCRIPT
+Restart=always
 
-# -----------------------------------------------------------------------------
-
-echo_success "Syncing files..."
-
-rm -rf "$dir/tmp"
-
-# Parse to_sync file
-while IFS= read -r line; do
-  line="${line/\~/$HOME}"  # replace ~ with $HOME
-  to_sync_files+=("$line")
-done < "$dir/to_sync.txt"
-
-# Ask config
-if [ ! "$SYNC_REPO_URL" ]; then
-  echo_warning "Config repo url: "
-  read -r SYNC_REPO_URL
-  echo "export SYNC_REPO_URL=$SYNC_REPO_URL" >> "$dir/.config"
-fi
-if [ ! "$SYNC_REMOTE_PATH" ]; then
-  echo_warning "Config sync dir: "
-  read -r SYNC_REMOTE_PATH
-  echo "export SYNC_REMOTE_PATH=$SYNC_REMOTE_PATH" >> "$dir/.config"
-fi
-
-# Initial setup, clone repo and ask if user wants to keep remote or local
-if [ -z "$SYNC_INITIAL_SETUP" ] || [ ! -d "$SYNC_REMOTE_PATH" ]; then
-  bareClone "$SYNC_REPO_URL" "$dir/tmp/repo"
-  copyLocalToDir "$dir/tmp/repo"
-  cd "$dir/tmp/repo"
-  git add .
-  if ! git diff --quiet origin/main; then
-    echo_warning "Local and remote differs"
-    git --no-pager diff --stat origin/main
-    echo_warning "Do you want to keep remote or local? ([r]emote/[l]ocal)"
-    read -r answer
-    if [ "$answer" = "r" ]; then
-      git reset --hard origin/main
-    elif [ "$answer" = "l" ]; then
-      git add .
-      git commit -m "sync"
-      git push --force
-    else
-      echo "Invalid input"
-      exit 1
-    fi
+[Install]
+WantedBy=default.target
+EOF
   fi
-  cd "$dir"
-  mv -v "$dir/tmp/repo" "$SYNC_REMOTE_PATH"
-  echo "export SYNC_INITIAL_SETUP=false" >> "$dir/.config"
+  systemctl --user daemon-reload
+  systemctl --user enable --now rclone_sync.$RCLONE_REMOTE
+  systemctl --user status rclone_sync.$RCLONE_REMOTE
+  echo "You can watch the service logs with this command:"
+  echo "    journalctl --user-unit rclone_sync.$RCLONE_REMOTE"
+  echo "You can watch the script logs with this command:"
+  echo "    tail -f /tmp/sync_tool.log"
+}
+
+
+# ----------------------------------- MAIN -------------------------------------
+
+if [ $# = 0 ]; then
+  # No arguments given, mount the remote for easy access (optional) and start the sync
+  mkdir -p $RCLONE_MOUNT
+  rclone mount $RCLONE_REMOTE $RCLONE_MOUNT &
+  rclone_sync
+else
+  # Run the given command with the following arguments
+  CMD=$1; shift;
+  $CMD "$@"
 fi
-
-
-
-#  git remote add sync $SYNC_REPO_URL
