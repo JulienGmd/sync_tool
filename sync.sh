@@ -4,6 +4,7 @@ set -e
 # Copy stdout and stderr to a log file
 exec > >(tee /tmp/sync_tool.log) 2>&1
 
+# Lock the script to prevent multiple instances from running
 lockfile -r 0 /tmp/sync_tool.lock || exit 1
 trap 'on_exit' EXIT
 
@@ -68,19 +69,17 @@ notify() {
 
 rclone_sync() {
 #  set -x
-  notify "Startup"
   rclone_pull
   # Watch for file events and do continuous immediate syncing and regular interval syncing:
   while inotifywait --recursive --timeout $FORCED_SYNC_INTERVAL -e $WATCH_EVENTS $RCLONE_LOCAL; do
     if [ $? -eq 0 ]; then  # file change detected
       sleep $SYNC_DELAY
       rclone_push
-      notify "Synchronized files change"
+      notify "Synchronized"
     elif [ $? -eq 1 ]; then  # inotifywait error
       notify "inotifywait error exit code 1"
       sleep 10
     elif [ $? -eq 2 ]; then  # every FORCED_SYNC_INTERVAL
-      echo "Forced synchronization"
       rclone_push
       notify "Synchronized"
     fi
@@ -94,9 +93,12 @@ systemd_setup() {
     echo "Unit file already exists: $SERVICE_FILE - Not overwriting."
   else
     mkdir -p "$(dirname "$SERVICE_FILE")"
+    # Note: the After= dbus.service doesn't work.
+    # Instead a sleep on script startup is used
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
 Description=Sync files with rclone
+After=network-online.target dbus.service
 
 [Service]
 ExecStart=$SYNC_SCRIPT
@@ -119,6 +121,7 @@ EOF
 # ----------------------------------- MAIN -------------------------------------
 
 if [ $# = 0 ]; then
+  sleep 10  # Wait for the network and dbus to be ready
   # No arguments given, mount the remote for easy access (optional) and start the sync
   mkdir -p $RCLONE_MOUNT
   rclone mount $RCLONE_REMOTE $RCLONE_MOUNT &
