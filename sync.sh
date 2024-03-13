@@ -44,6 +44,8 @@ SYNC_SCRIPT=$(realpath "$0")
 on_exit() {
   rm -f /tmp/sync_tool.lock;
   rm -f /tmp/sync_tool_push_pull.lock;
+  fusermount -u $RCLONE_MOUNT  # Unmount the remote
+  echo "Exiting"
 }
 
 rclone_pull() {
